@@ -1,24 +1,16 @@
-# scripts/bsm_model/chooser_option.py
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-
+import yaml
+from pathlib import Path
 
 class ChooserOptionBSM:
     """
-    BSM 两期模拟的 Chooser Option 定价器
-    参数:
-        S0: 当前标的资产价格
-        K: 行权价
-        T1: 决策时间（年）
-        T2: 到期时间（年）
-        r: 无风险利率（连续复利）
-        sigma: 波动率
-        q: 股息率（连续）
-        n_sim: 模拟次数
+    BSM 模型下的 Chooser Option 定价
+    验证：    - Exploration_of_JPMorgan_Chooser_Option_Pricing
     """
-
-    def __init__(self, S0, K, T1, T2, r, sigma, q, n_sim=10000):
+    def __init__(self, S0, K, T1, T2, r, sigma, q, n_sim=100000, seed=42):
         self.S0 = S0
         self.K = K
         self.T1 = T1
@@ -27,91 +19,141 @@ class ChooserOptionBSM:
         self.sigma = sigma
         self.q = q
         self.n_sim = n_sim
-        np.random.seed(42)  # 可复现
+        self.seed = seed
+        np.random.seed(seed)
 
-    def simulate_price(self, S_start, T, dt=1 / 252):
-        """从 S_start 模拟到 T 年后的价格（几何布朗运动）"""
-        n_steps = int(T / dt)
-        S = np.full(self.n_sim, S_start)
-        for _ in range(n_steps):
-            z = np.random.standard_normal(self.n_sim)
-            S = S * np.exp((self.r - self.q - 0.5 * self.sigma ** 2) * dt
-                           + self.sigma * np.sqrt(dt) * z)
-        return S
+    # ---------- 辅助函数 ----------
+    def _simulate_price(self, S_start, T):
+        """
+        向量化一步模拟终期价格
+        S_start: 标量 或 数组
+        T: 时间间隔（年）
+        返回: 模拟后的价格数组，长度 = self.n_sim (若S_start标量) 或 len(S_start) (若S_start数组)
+        """
+        if hasattr(S_start, '__len__'):
+            n = len(S_start)
+        else:
+            n = self.n_sim  # ✅ 关键修正：使用 self.n_sim
+        mu = (self.r - self.q - 0.5 * self.sigma ** 2) * T
+        sigma_sqrtT = self.sigma * np.sqrt(T)
+        z = np.random.standard_normal(n)
+        return S_start * np.exp(mu + sigma_sqrtT * z)
 
-    def price(self):
-        """返回 Chooser Option 的当前理论价格"""
-        # 第一步：模拟决策日 T1 的股价
-        S_T1 = self.simulate_price(self.S0, self.T1)
-
-        # 在 T1 决定是 call 还是 put
+    # ---------- 蒙特卡洛定价（返回平均价格）----------
+    def price_mc(self):
+        """蒙特卡洛模拟 Chooser Option 当前价值（向量化）"""
+        # 第一步：模拟决策日股价
+        S_T1 = self._simulate_price(self.S0, self.T1)   # shape (n_sim,)
         is_call = S_T1 > self.K
 
-        # 第二步：根据选择，分别模拟到期日股价
-        S_T2 = np.zeros(self.n_sim)
-        for i in range(self.n_sim):
-            if is_call[i]:
-                # 看涨：从 S_T1[i] 模拟到 T2
-                S_T2[i] = self.simulate_price(S_T1[i], self.T2 - self.T1)[0]  # 注意只取一个样本路径
-            else:
-                # 看跌
-                S_T2[i] = self.simulate_price(S_T1[i], self.T2 - self.T1)[0]
+        # 第二步：模拟到期日股价（基于每个 S_T1 的一条路径）
+        S_T2 = self._simulate_price(S_T1, self.T2 - self.T1)
 
         # 计算 payoff
         payoff_call = np.maximum(S_T2 - self.K, 0)
-        payoff_put = np.maximum(self.K - S_T2, 0)
+        payoff_put  = np.maximum(self.K - S_T2, 0)
         payoff = np.where(is_call, payoff_call, payoff_put)
 
-        # 折现到当前
-        option_price = np.exp(-self.r * self.T2) * np.mean(payoff)
-        return option_price
+        # 折现
+        price = np.exp(-self.r * self.T2) * np.mean(payoff)
+        return price
 
-    def price_with_analytical_formula(self):
-        """
-        论文中未给出解析解，但 Chooser Option 有闭式解（Rubinstein 1991）：
-        C = C(S0, K, T2) + P(S0, K, T1)  其中 C 和 P 是普通欧式期权价格
-        注意：这里假设股息率为 q
-        """
-
-        # 计算 d1, d2 函数
+    # ---------- 解析公式定价 ----------
+    def price_analytical(self):
+        """Chooser Option 解析公式"""
         def d1(S, K, T, r, sigma, q):
-            return (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-
+            return (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
         def d2(d1, sigma, T):
-            return d1 - sigma * np.sqrt(T)
+            return d1 - sigma*np.sqrt(T)
 
-        # 普通欧式看涨价格
         def call_price(S, K, T, r, sigma, q):
             d1_val = d1(S, K, T, r, sigma, q)
             d2_val = d2(d1_val, sigma, T)
-            return S * np.exp(-q * T) * norm.cdf(d1_val) - K * np.exp(-r * T) * norm.cdf(d2_val)
+            return S * np.exp(-q*T) * norm.cdf(d1_val) - K * np.exp(-r*T) * norm.cdf(d2_val)
 
-        # 普通欧式看跌价格
         def put_price(S, K, T, r, sigma, q):
             d1_val = d1(S, K, T, r, sigma, q)
             d2_val = d2(d1_val, sigma, T)
-            return K * np.exp(-r * T) * norm.cdf(-d2_val) - S * np.exp(-q * T) * norm.cdf(-d1_val)
+            return K * np.exp(-r*T) * norm.cdf(-d2_val) - S * np.exp(-q*T) * norm.cdf(-d1_val)
 
-        # Chooser 解析公式（European chooser with same strike）
+        # Chooser = 欧式看涨(T2) + 欧式看跌(T1)
         C_T2 = call_price(self.S0, self.K, self.T2, self.r, self.sigma, self.q)
         P_T1 = put_price(self.S0, self.K, self.T1, self.r, self.sigma, self.q)
         return C_T2 + P_T1
 
+    # ---------- 生成路径表格（论文 Table 3 对比）----------
+    def generate_path_table(self, n_paths=10):
+        """生成 n_paths 条模拟路径，返回 DataFrame"""
+        # 临时修改模拟次数
+        original_n_sim = self.n_sim
+        self.n_sim = n_paths
+        np.random.seed(self.seed)   # 保证可复现
 
-# 测试参数（论文 Table 2）
+        # 模拟 T1 和 T2 股价
+        S_T1 = self._simulate_price(self.S0, self.T1)
+        choices = np.where(S_T1 > self.K, 'CALL', 'PUT')
+        S_T2 = self._simulate_price(S_T1, self.T2 - self.T1)
+
+        # 计算 payoff
+        payoff_call = np.maximum(S_T2 - self.K, 0)
+        payoff_put  = np.maximum(self.K - S_T2, 0)
+        payoff = np.where(S_T1 > self.K, payoff_call, payoff_put)
+
+        # 恢复原模拟次数
+        self.n_sim = original_n_sim
+
+        df = pd.DataFrame({
+            '1st ST': np.round(S_T1, 2),
+            'Choice': choices,
+            '2nd ST (based)': np.round(S_T2, 2),
+            'Payoff': np.round(payoff, 2)
+        })
+        return df
+
+    def set_sigma_from_history(self, returns_series, window=20):
+        """
+        根据历史收益率序列计算滚动波动率（年化），并更新 self.sigma
+        returns_series: 日收益率序列（pandas Series）
+        window: 滚动窗口大小（交易日）
+        """
+        rolling_std = returns_series.rolling(window).std() * np.sqrt(252)
+        # 返回最新值，但这里我们会在外部循环中逐日使用
+        return rolling_std
+
+# ---------- 命令行测试 ----------
 if __name__ == "__main__":
-    params = {
-        "S0": 156.7,
-        "K": 150,
-        "T1": 0.5,
-        "T2": 1.0,
-        "r": 0.0015,
-        "sigma": 0.282,
-        "q": 0.0233,
-        "n_sim": 50000
-    }
-    chooser = ChooserOptionBSM(**params)
-    price_mc = chooser.price()
-    price_analytical = chooser.price_with_analytical_formula()
-    print(f"蒙特卡洛模拟价格: {price_mc:.4f}")
-    print(f"解析公式价格: {price_analytical:.4f}")
+    # 加载参数（也可直接写死在代码中）
+    params_path = Path(__file__).parent.parent.parent / "params.yaml"
+    if params_path.exists():
+        with open(params_path, 'r', encoding="utf-8") as f:
+            params = yaml.safe_load(f)
+    else:
+        # 默认参数（论文 Table 2）
+        params = {
+            "S0": 156.7, "K": 150, "T1": 0.5, "T2": 1.0,
+            "r": 0.0015, "sigma": 0.282, "q": 0.0233,
+            "n_sim_mc": 100000, "random_seed": 42
+        }
+
+    chooser = ChooserOptionBSM(
+        S0=params['S0'],
+        K=params['K'],
+        T1=params['T1'],
+        T2=params['T2'],
+        r=params['r'],
+        sigma=params['sigma'],
+        q=params['q'],
+        n_sim=params.get('n_sim_mc', 100000),
+        seed=params.get('random_seed', 42)
+    )
+
+    # 蒙特卡洛价格 vs 解析价格
+    price_mc = chooser.price_mc()
+    price_ana = chooser.price_analytical()
+    print(f"蒙特卡洛价格 (n_sim={chooser.n_sim}): {price_mc:.4f}")
+    print(f"解析公式价格: {price_ana:.4f}")
+
+    # 生成 10 次模拟路径表格
+    df_paths = chooser.generate_path_table(n_paths=10)
+    print("\n10次模拟路径（与论文 Table 3 对比）:")
+    print(df_paths.to_string(index=False))
